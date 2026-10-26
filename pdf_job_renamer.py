@@ -4,9 +4,11 @@ DOK Solutions — PDF Job Number Renamer
 Extracts JOB NUMBER from Gensoft Logistics ERP invoices
 and saves each PDF renamed as {JOB_NUMBER}.pdf
 
-Build EXE:
+Build EXE (bundles Tesseract-OCR so target PCs need nothing pre-installed):
     pip install pymupdf pytesseract pillow tkinterdnd2 pyinstaller
-    pyinstaller --onefile --windowed --name "DOK PDF Renamer" pdf_job_renamer.py
+    Ensure vendor/tesseract-ocr/ exists (tesseract.exe + DLLs + tessdata/eng.traineddata,
+    copied from a local Tesseract-OCR install), then:
+    pyinstaller "DOK PDF Renamer.spec"
 """
 
 import json
@@ -25,10 +27,32 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pymupdf"])
     import fitz
 
+def _find_tesseract_cmd() -> str:
+    """
+    Locate the tesseract binary to use. When running as a frozen EXE, prefer
+    the copy bundled alongside the app (vendor/tesseract-ocr) so the app
+    works on a PC with no Tesseract install at all. Falls back to the
+    standard system install location for running from source, then to
+    whatever `tesseract` resolves to on PATH.
+    """
+    import sys
+    if getattr(sys, "frozen", False):
+        bundled = Path(sys._MEIPASS) / "tesseract-ocr" / "tesseract.exe"
+        if bundled.is_file():
+            os.environ["TESSDATA_PREFIX"] = str(bundled.parent / "tessdata")
+            return str(bundled)
+
+    system_install = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+    if system_install.is_file():
+        return str(system_install)
+
+    return shutil.which("tesseract") or "tesseract"
+
+
 try:
     import pytesseract
     from PIL import Image
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    pytesseract.pytesseract.tesseract_cmd = _find_tesseract_cmd()
     OCR_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
@@ -72,13 +96,15 @@ def _pdf_to_text_ocr(pdf_path: str) -> str:
 def _ocr_pod_region(pdf_path: str) -> str:
     """
     Targeted OCR for poor-quality POD scans where standard full-page OCR
-    misses the reference number in the top-right box.  Tries two passes:
+    misses the reference number in the top-right box.  Tries two color
+    passes at increasing rotation correction until a number is found:
       1. Grayscale high-contrast — works for blue or dark-colored numbers.
       2. Red-channel extraction   — works for red-colored numbers (e.g. 1c.pdf).
-    Returns the first plausible 5-10 digit number found, or empty string.
+    Returns the most-agreed-upon 5-10 digit number found, or empty string.
     """
     try:
         import numpy as np
+        from collections import Counter
         from PIL import ImageEnhance
         doc = fitz.open(pdf_path)
         results = []
@@ -89,7 +115,7 @@ def _ocr_pod_region(pdf_path: str) -> str:
             w, h = img.size
             # Tight crop: right 40% of page, top 25% — targets the number box
             # precisely (ABS Courier always puts it at top-right, ~60-100% x, 10-25% y)
-            crop = img.crop((int(w * 0.60), int(h * 0.08), w, int(h * 0.28))  )
+            crop = img.crop((int(w * 0.60), int(h * 0.08), w, int(h * 0.28)))
 
             cfg_line  = "--psm 7 -c tessedit_char_whitelist=0123456789"
             cfg_block = "--psm 6 -c tessedit_char_whitelist=0123456789"
@@ -97,22 +123,59 @@ def _ocr_pod_region(pdf_path: str) -> str:
             # Pass 1: grayscale + high contrast (blue/dark numbers)
             gray = ImageEnhance.Contrast(crop.convert("L")).enhance(4)
             gray = gray.point(lambda x: 0 if x < 150 else 255)
-            for cfg in (cfg_line, cfg_block):
-                for token in re.findall(r"\d{5,10}", pytesseract.image_to_string(gray, config=cfg)):
-                    results.append(token)
 
-            # Pass 2: red-channel isolation (red numbers like in 1c.pdf)
+            # Pass 2: red-channel isolation (red numbers like in 1c.pdf),
+            # then binarized the same way the grayscale pass is — without
+            # this the extracted channel is a faint gray-on-white image
+            # that Tesseract frequently fails to read at all.
             r_arr = np.array(crop.split()[0], dtype=np.float32)
             g_arr = np.array(crop.split()[1], dtype=np.float32)
             b_arr = np.array(crop.split()[2], dtype=np.float32)
             score = np.clip(r_arr - (g_arr + b_arr) / 2, 0, 255).astype(np.uint8)
-            red_img = Image.fromarray(255 - score).convert("L")
-            for cfg in (cfg_line, cfg_block):
-                for token in re.findall(r"\d{5,10}", pytesseract.image_to_string(red_img, config=cfg)):
-                    results.append(token)
+            red = Image.fromarray(255 - score).convert("L")
+            red = red.point(lambda x: 0 if x < 230 else 255)
+
+            for base_img in (gray, red):
+                for cfg in (cfg_line, cfg_block):
+                    for token in re.findall(r"\d{5,10}", pytesseract.image_to_string(base_img, config=cfg)):
+                        results.append(token)
+
+            # Some scans are fed in at a slight angle (skewed originals),
+            # which breaks single-line OCR entirely. Only pay the cost of
+            # a rotation sweep when the unrotated passes above found
+            # nothing, then pick the reading most angles agree on.
+            if not results:
+                for angle in range(-20, 21, 5):
+                    if angle == 0:
+                        continue
+                    for base_img in (gray, red):
+                        rotated = base_img.rotate(angle, expand=True, fillcolor=255)
+                        for token in re.findall(r"\d{5,10}", pytesseract.image_to_string(rotated, config=cfg_line)):
+                            results.append(token)
 
         doc.close()
-        return results[0] if results else ""
+        if not results:
+            return ""
+        counts = Counter(results)
+        # A short token that's just a prefix of a longer one seen elsewhere
+        # (e.g. "17961" vs "1796176") is a truncated read, not a genuine
+        # competing answer — drop it, but let it add corroborating support
+        # to the fuller reading it was cut from.
+        support = {}
+        for t in counts:
+            if any(o != t and o.startswith(t) for o in counts):
+                continue  # truncated read of a longer candidate, not itself a candidate
+            support[t] = sum(c for o, c in counts.items() if o == t or t.startswith(o))
+        if not support:
+            return ""
+        best = max(support, key=lambda t: (support[t], len(t)))
+        # Require at least two independent passes to agree before trusting
+        # a read — a single unconfirmed guess is worse than reporting
+        # nothing, since it would silently misfile the PDF instead of
+        # leaving it for manual review.
+        if support[best] < 2:
+            return ""
+        return best
     except Exception:
         return ""
 
@@ -144,10 +207,21 @@ def _search_job_number(text: str):
         rf"{JOB_LABEL}[^A-Z\n]*{LETTER_VALUE}",
         rf"{JOB_LABEL}[^\n]*\n[^A-Z\n]*{LETTER_VALUE}",
     ]
+    # OCR sometimes drops a stray junk character right where a trailing
+    # "-NN" style suffix begins (e.g. "...26010006~-00", the "~" is pure
+    # OCR noise) which stops VALUE's match short and silently truncates a
+    # real part of the job number. If a "-suffix" or "_suffix" is sitting
+    # just past where the match ended, separated only by 0-2 junk
+    # characters, it belongs to the value — reattach it.
+    TAIL = re.compile(r"[^A-Z0-9\n]{0,2}([\-_][A-Z0-9]{1,4})\b", re.IGNORECASE)
+
     for pat in patterns:
         for m in re.finditer(pat, text, re.IGNORECASE):
             candidate = m.group(1).strip().upper()
             if candidate not in BLACKLIST:
+                tail_m = TAIL.match(text, m.end())
+                if tail_m:
+                    candidate += tail_m.group(1).upper()
                 return candidate
     return None
 
@@ -234,9 +308,14 @@ def extract_job_number(pdf_path: str):
 
             # Weak text match (garbled OCR line) or no match: run the targeted
             # high-zoom crop OCR which is more accurate for digit-level reads.
-            pod_from_region = ""
-            if re.search(r"ABS\s*COURIER", ocr_text, re.IGNORECASE):
-                pod_from_region = _ocr_pod_region(pdf_path)
+            # This used to be gated on the full-page OCR text containing the
+            # literal phrase "ABS COURIER", but that phrase is exactly the
+            # kind of text full-page OCR garbles on poor scans ("3S COURIER",
+            # "COURIER (PVT) LTD." with "ABS" dropped, etc.) — so the gate
+            # was silently skipping the accurate fallback on most of the
+            # scans it exists to rescue. Always try it once cheaper text
+            # matches have failed.
+            pod_from_region = _ocr_pod_region(pdf_path)
 
             job = pod_from_region or pod_from_text
             if job:
@@ -255,8 +334,10 @@ _ILLEGAL_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 
 
 def sanitize_filename(name: str) -> str:
-    """Replace characters Windows won't allow in a filename."""
-    return _ILLEGAL_FILENAME_CHARS.sub("-", name).strip(" .")
+    """Replace characters Windows won't allow in a filename, and dashes
+    with underscores (e.g. "ABACF26020281-SI" -> "ABACF26020281_SI")."""
+    name = _ILLEGAL_FILENAME_CHARS.sub("-", name)
+    return name.replace("-", "_").strip(" .")
 
 
 def unique_dest(dest_dir: Path, base_name: str, ext: str = ".pdf") -> Path:
@@ -267,6 +348,37 @@ def unique_dest(dest_dir: Path, base_name: str, ext: str = ".pdf") -> Path:
         n += 1
         dest = dest_dir / f"{base_name}_{n}{ext}"
     return dest
+
+
+def unique_job_dest(dest_dir: Path, base_name: str, ext: str = ".pdf"):
+    """
+    Path for a job-number output file: base.pdf while the job number is
+    unique. The moment a second PDF with the same job number shows up, the
+    first file is renamed base_01.pdf and the new one becomes base_02.pdf
+    (further duplicates continue base_03.pdf, …) so the numbering only
+    ever appears once duplicates actually exist.
+
+    Returns (dest, promoted_name): promoted_name is the new filename the
+    earlier bare file was renamed to (e.g. "base_01.pdf"), or None if no
+    rename happened — the caller uses it to fix up any on-screen row that
+    was reported under the now-stale bare name.
+    """
+    bare  = dest_dir / f"{base_name}{ext}"
+    first = dest_dir / f"{base_name}_01{ext}"
+    if not bare.exists() and not first.exists():
+        return bare, None
+
+    promoted = None
+    if bare.exists():
+        bare.rename(first)
+        promoted = first.name
+
+    n = 2
+    while True:
+        dest = dest_dir / f"{base_name}_{n:02d}{ext}"
+        if not dest.exists():
+            return dest, promoted
+        n += 1
 
 
 # ── Config persistence ────────────────────────────────────────────────────────
@@ -351,6 +463,11 @@ class App(BaseClass):
         self._watch_worker   = None
         self._watch_ok       = 0
         self._watch_fail     = 0
+        self._job_bare_pname = {}     # job base_name -> original pdf filename
+                                       # whose row currently shows the bare
+                                       # (unsuffixed) saved name, so it can
+                                       # be fixed up if a later duplicate
+                                       # promotes it to "_01"
 
         self._build_ui()
         self._restore_config_ui()
@@ -774,9 +891,16 @@ class App(BaseClass):
             try:
                 out_base = Path(self.output_dir)
                 out_base.mkdir(parents=True, exist_ok=True)
-                dest = unique_dest(out_base, sanitize_filename(job) or "JOB")
+                base_name = sanitize_filename(job) or "JOB"
+                dest, promoted = unique_job_dest(out_base, base_name)
+                if promoted:
+                    prev_pname = self._job_bare_pname.pop(base_name, None)
+                    if prev_pname:
+                        self.after(0, self._rename_saved_row, prev_pname, promoted)
                 shutil.copy2(path, str(dest))
                 saved_as = dest.name
+                if dest.name == f"{base_name}.pdf":
+                    self._job_bare_pname[base_name] = pname
                 status, tag = "✓  Extracted", "ok"
             except Exception as e:
                 job, err = None, f"Copy error: {e}"
@@ -821,11 +945,21 @@ class App(BaseClass):
             self.watch_status.config(text=f"Watching…  ✓ {ok}  ✗ {fail}")
         self.open_btn.config(state="normal")
 
+    def _rename_saved_row(self, pname, new_saved_as):
+        """Fix up a previously-inserted row whose saved-as name became
+        stale because a later duplicate promoted it to "_01"."""
+        for iid in self.tree.get_children():
+            values = self.tree.item(iid, "values")
+            if values and values[0] == pname:
+                self.tree.set(iid, "renamed", new_saved_as)
+                break
+
     def _clear_files(self):
         self.files = []
         self._refresh_file_list()
         for row in self.tree.get_children():
             self.tree.delete(row)
+        self._job_bare_pname.clear()
         self._update_stats(0, 0, 0)
         self.prog_var.set(0)
         self.prog_lbl.config(text="")
@@ -847,6 +981,7 @@ class App(BaseClass):
         self.run_btn.config(state="disabled", text="Processing…")
         for row in self.tree.get_children():
             self.tree.delete(row)
+        self._job_bare_pname.clear()
         self.prog_var.set(0)
         self.prog_lbl.config(text="")
         threading.Thread(target=self._process_all, daemon=True).start()
@@ -855,7 +990,6 @@ class App(BaseClass):
         total    = len(self.files)
         ok       = 0
         fail     = 0
-        job_seen = {}
         out_base = Path(self.output_dir) if self.output_dir else None
 
         if out_base is not None:
@@ -876,21 +1010,17 @@ class App(BaseClass):
                 base_name = sanitize_filename(job) or "JOB"
                 dest_dir  = out_base or Path(path).parent
 
-                # Bump the suffix until we land on a name that's neither
-                # used earlier in this run nor already present on disk —
-                # avoids silently overwriting prior output.
-                job_seen[base_name] = job_seen.get(base_name, 0)
-                while True:
-                    job_seen[base_name] += 1
-                    n = job_seen[base_name]
-                    fname = base_name if n == 1 else f"{base_name}_{n}"
-                    dest  = dest_dir / f"{fname}.pdf"
-                    if not dest.exists():
-                        break
+                dest, promoted = unique_job_dest(dest_dir, base_name)
+                if promoted:
+                    prev_pname = self._job_bare_pname.pop(base_name, None)
+                    if prev_pname:
+                        self.after(0, self._rename_saved_row, prev_pname, promoted)
 
                 try:
                     shutil.copy2(path, str(dest))
-                    saved_as = f"{fname}.pdf"
+                    saved_as = dest.name
+                    if dest.name == f"{base_name}.pdf":
+                        self._job_bare_pname[base_name] = pname
                     status   = "✓  Extracted"
                     ok      += 1
                     tag      = "ok"

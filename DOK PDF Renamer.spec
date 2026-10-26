@@ -5,7 +5,7 @@ a = Analysis(
     ['pdf_job_renamer.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('vendor/tesseract-ocr', 'tesseract-ocr')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
