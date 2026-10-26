@@ -169,11 +169,22 @@ def _ocr_pod_region(pdf_path: str) -> str:
         if not support:
             return ""
         best = max(support, key=lambda t: (support[t], len(t)))
-        # Require at least two independent passes to agree before trusting
-        # a read — a single unconfirmed guess is worse than reporting
-        # nothing, since it would silently misfile the PDF instead of
-        # leaving it for manual review.
-        if support[best] < 2:
+        # Competing candidates (e.g. a digit misread differently by two
+        # passes) need a second pass to agree before either is trusted —
+        # an unconfirmed guess chosen between two live possibilities is
+        # worse than reporting nothing. But when only one candidate was
+        # found at all, there's no competing guess to be wary of: most
+        # scans only have one pass (grayscale vs red-channel, line vs
+        # block mode) actually land a clean read, with the others coming
+        # back empty rather than wrong — that single clean read should
+        # still be trusted.
+        if len(support) > 1 and support[best] < 2:
+            return ""
+        # A single, uncorroborated candidate shorter than every genuine POD
+        # number we've seen (6-7 digits) is more likely a partial misread
+        # (e.g. the leading digits dropped) than a real short ID — treat it
+        # as unconfirmed rather than trust it blindly.
+        if len(support) == 1 and len(best) < 6:
             return ""
         return best
     except Exception:
@@ -233,19 +244,27 @@ def _search_pod_number(text: str, weak_ok: bool = True):
     garbled OCR line and may have digit-level misreads.
     Returns (None, False) if nothing was found.
     """
+    # A line that's otherwise just the number (e.g. "| 1797715 j") can carry
+    # a stray OCR character — a misread pipe/bullet — right next to the
+    # digits. Tolerate up to 2 such junk characters on either side rather
+    # than requiring the whole cleaned line to be pure digits.
+    DIGIT_LINE = re.compile(r"[^\d]{0,2}(\d{5,10})[^\d]{0,2}")
+
     for m in re.finditer(r"PROOF\s+OF\s+DELIVERY(?:\s+NOTE)?", text, re.IGNORECASE):
         # 1) Same-line: number right after header with only whitespace/pipes
         rest_of_line = text[m.end():].split("\n")[0]
         same_line = re.sub(r"[\|\[\]{}\s]", "", rest_of_line)
-        if re.fullmatch(r"\d{5,10}", same_line):
-            return same_line, True
+        dm = DIGIT_LINE.fullmatch(same_line)
+        if dm:
+            return dm.group(1), True
 
         # 2) Next few lines: scan up to 250 chars after this occurrence.
         after = text[m.end(): m.end() + 250]
         for line in after.split("\n"):
             cleaned = re.sub(r"[\|\[\]{}\s]", "", line)
-            if re.fullmatch(r"\d{5,10}", cleaned):
-                return cleaned, True
+            dm = DIGIT_LINE.fullmatch(cleaned)
+            if dm:
+                return dm.group(1), True
 
     # 3) ABS Courier fallback when header is missing or number was outside window
     if re.search(r"ABS\s*COURIER", text, re.IGNORECASE):
